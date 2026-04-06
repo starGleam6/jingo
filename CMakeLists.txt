@@ -1,0 +1,1132 @@
+# CMakeLists.txt - JinGo VPN Client
+cmake_minimum_required(VERSION 3.21)
+
+include(cmake/Policies.cmake)
+include(cmake/Settings.cmake)
+
+if(ANDROID)
+    include(cmake/Platform-Android.cmake)
+endif()
+
+project(JinGo
+    VERSION 1.3.0
+    DESCRIPTION "Cross-platform Xray VPN Client - JinGo"
+    LANGUAGES C CXX
+)
+
+if(APPLE AND NOT ANDROID)
+    enable_language(OBJCXX)
+endif()
+
+# Platform detection
+set(TARGET_MACOS OFF)
+set(TARGET_IOS OFF)
+set(TARGET_ANDROID OFF)
+set(TARGET_WINDOWS OFF)
+set(TARGET_LINUX OFF)
+
+if(ANDROID)
+    set(TARGET_ANDROID ON)
+    message(STATUS "Target platform: Android (${ANDROID_ABI})")
+elseif(IOS)
+    set(TARGET_IOS ON)
+    message(STATUS "Target platform: iOS")
+elseif(APPLE)
+    set(TARGET_MACOS ON)
+    message(STATUS "Target platform: macOS")
+elseif(WIN32)
+    set(TARGET_WINDOWS ON)
+    message(STATUS "Target platform: Windows")
+elseif(UNIX)
+    set(TARGET_LINUX ON)
+    message(STATUS "Target platform: Linux")
+endif()
+
+# Bundle ID configuration
+if(NOT APP_BUNDLE_ID)
+    set(APP_BUNDLE_ID "work.opine.jingo" CACHE STRING "Application Bundle Identifier")
+endif()
+message(STATUS "App Bundle ID: ${APP_BUNDLE_ID}")
+set(PACKET_TUNNEL_BUNDLE_ID "${APP_BUNDLE_ID}.PacketTunnelProvider")
+
+# Code signing configuration (Apple platforms)
+if(NOT APPLE_CODE_SIGN_IDENTITY)
+    set(APPLE_CODE_SIGN_IDENTITY "Apple Development" CACHE STRING "Code signing identity")
+endif()
+if(NOT APPLE_DEVELOPMENT_TEAM)
+    set(APPLE_DEVELOPMENT_TEAM "6HP2RFA5AK" CACHE STRING "Apple Development Team ID")
+endif()
+message(STATUS "Code Sign Identity: ${APPLE_CODE_SIGN_IDENTITY}")
+message(STATUS "Development Team: ${APPLE_DEVELOPMENT_TEAM}")
+
+if(BUILD_KEYCHAIN_PATH)
+    message(STATUS "Build Keychain: ${BUILD_KEYCHAIN_PATH}")
+endif()
+
+# iOS Provisioning Profiles
+if(NOT IOS_PROFILE_MAIN)
+    set(IOS_PROFILE_MAIN "JinGo Accelerator iOS" CACHE STRING "iOS Main App Provisioning Profile")
+endif()
+if(NOT IOS_PROFILE_PACKET_TUNNEL)
+    set(IOS_PROFILE_PACKET_TUNNEL "JinGo PacketTunnel iOS" CACHE STRING "iOS PacketTunnel Provisioning Profile")
+endif()
+
+# macOS Provisioning Profiles
+if(NOT MACOS_PROFILE_MAIN)
+    set(MACOS_PROFILE_MAIN "JinGo_Accelerator_macOS" CACHE STRING "macOS Main App Provisioning Profile")
+endif()
+if(NOT MACOS_PROFILE_PACKET_TUNNEL)
+    set(MACOS_PROFILE_PACKET_TUNNEL "JinGo_PacketTunnel_macOS" CACHE STRING "macOS PacketTunnel Provisioning Profile")
+endif()
+
+# Dependencies
+set(QT_NO_DISABLE_WARN_DUPLICATE_LIBRARIES ON)
+include(cmake/Dependencies-Qt.cmake)
+# SuperRay is statically merged into JinDoCore on all platforms
+
+# JinDoCore static library configuration
+set(JINDO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../JinDo" CACHE PATH "Path to JinDo project")
+set(JINDO_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jindo")
+
+if(TARGET_ANDROID)
+    set(JINDO_LIB_DIR "${JINDO_THIRD_PARTY}/android/${CMAKE_ANDROID_ARCH_ABI}")
+    set(JINDO_INCLUDE_DIR "${JINDO_THIRD_PARTY}/android/include")
+elseif(TARGET_IOS OR TARGET_MACOS)
+    set(JINDO_XCFRAMEWORK "${JINDO_THIRD_PARTY}/apple/JinDoCore.xcframework")
+    if(TARGET_IOS)
+        if(CMAKE_OSX_SYSROOT MATCHES "iphonesimulator")
+            set(JINDO_LIB_DIR "${JINDO_XCFRAMEWORK}/ios-arm64_x86_64-simulator")
+        else()
+            set(JINDO_LIB_DIR "${JINDO_XCFRAMEWORK}/ios-arm64")
+        endif()
+    else()
+        set(JINDO_LIB_DIR "${JINDO_XCFRAMEWORK}/macos-arm64_x86_64")
+    endif()
+    set(JINDO_INCLUDE_DIR "${JINDO_LIB_DIR}/Headers")
+    set(JINDO_LIB_FILE "${JINDO_LIB_DIR}/libJinDoCore.a")
+elseif(TARGET_WINDOWS)
+    set(JINDO_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jindo/windows/mingw64")
+elseif(TARGET_LINUX)
+    set(JINDO_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/jindo/linux/x64")
+endif()
+
+if(NOT JINDO_INCLUDE_DIR)
+    set(JINDO_INCLUDE_DIR "${JINDO_LIB_DIR}/include")
+endif()
+if(NOT JINDO_LIB_FILE)
+    set(JINDO_LIB_FILE "${JINDO_LIB_DIR}/libJinDoCore.a")
+endif()
+
+if(EXISTS "${JINDO_LIB_FILE}")
+    message(STATUS "JinDoCore library: ${JINDO_LIB_FILE}")
+    message(STATUS "JinDoCore headers: ${JINDO_INCLUDE_DIR}")
+    add_library(JinDoCore STATIC IMPORTED)
+    set_target_properties(JinDoCore PROPERTIES IMPORTED_LOCATION "${JINDO_LIB_FILE}")
+
+    # Set interface link libraries for JinDoCore (Go/CGO needs resolv on Linux)
+    if(TARGET_LINUX)
+        # Compile wrapper to provide __res_search symbol for Go/CGO
+        set(RES_WRAPPER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/linux/res_search_wrapper.c")
+        set(RES_WRAPPER_OBJ "${CMAKE_CURRENT_BINARY_DIR}/res_search_wrapper.o")
+        add_custom_command(
+            OUTPUT "${RES_WRAPPER_OBJ}"
+            COMMAND ${CMAKE_C_COMPILER} -c -o "${RES_WRAPPER_OBJ}" "${RES_WRAPPER_SRC}"
+            DEPENDS "${RES_WRAPPER_SRC}"
+            COMMENT "Compiling res_search_wrapper.c"
+        )
+        add_custom_target(res_search_wrapper DEPENDS "${RES_WRAPPER_OBJ}")
+        set_target_properties(JinDoCore PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${RES_WRAPPER_OBJ};-Wl,--push-state,--no-as-needed;resolv;c;-Wl,--pop-state;z"
+        )
+    endif()
+else()
+    message(FATAL_ERROR "JinDoCore library not found: ${JINDO_LIB_FILE}")
+endif()
+
+# Platform-specific configuration
+if(TARGET_ANDROID)
+    include(cmake/Platform-Android.cmake)
+elseif(TARGET_IOS)
+    include(cmake/Platform-iOS.cmake)
+elseif(TARGET_MACOS)
+    include(cmake/Platform-macOS.cmake)
+elseif(TARGET_WINDOWS)
+    include(cmake/Platform-Windows.cmake)
+elseif(TARGET_LINUX)
+    include(cmake/Platform-Linux.cmake)
+endif()
+
+# Source files (using JinDoCore library)
+set(CORE_SOURCES "")
+set(STORAGE_SOURCES "")
+set(UTIL_SOURCES "")
+set(NETWORK_SOURCES "")
+
+set(PANEL_SOURCES
+    src/panel/v2board/V2BoardProvider.cpp
+    src/panel/v2board/V2BoardProvider.h
+    src/panel/v2board/V2BoardNormalizer.cpp
+    src/panel/v2board/V2BoardNormalizer.h
+    src/panel/xboard/XBoardProvider.h
+    src/panel/xboard/XBoardNormalizer.cpp
+    src/panel/xboard/XBoardNormalizer.h
+)
+
+# JinGo 独有模型（QML 绑定）- 已移至 viewmodels
+set(MODEL_SOURCES)
+
+# ViewModels（UI 层）- 必须包含头文件以便 AUTOMOC 处理
+set(VIEWMODEL_SOURCES
+    src/viewmodels/LoginViewModel.cpp
+    src/viewmodels/LoginViewModel.h
+    src/viewmodels/RegisterViewModel.cpp
+    src/viewmodels/RegisterViewModel.h
+    src/viewmodels/ServerListViewModel.cpp
+    src/viewmodels/ServerListViewModel.h
+    src/viewmodels/ServerListModel.cpp
+    src/viewmodels/ServerListModel.h
+    src/viewmodels/ConnectionViewModel.cpp
+    src/viewmodels/ConnectionViewModel.h
+    src/viewmodels/SettingsViewModel.cpp
+    src/viewmodels/SettingsViewModel.h
+    src/viewmodels/InviteViewModel.cpp
+    src/viewmodels/InviteViewModel.h
+    src/viewmodels/UserStatsViewModel.cpp
+    src/viewmodels/UserStatsViewModel.h
+    src/viewmodels/SubscriptionListModel.cpp
+    src/viewmodels/SubscriptionListModel.h
+)
+
+# UI 模块（仅桌面平台）
+if(NOT TARGET_ANDROID AND NOT TARGET_IOS)
+    set(UI_SOURCES
+        src/ui/SystemTrayManager.cpp
+        src/ui/SystemTrayManager.h
+    )
+else()
+    set(UI_SOURCES "")
+endif()
+
+# Platform resources
+if(TARGET_MACOS)
+    set(MACOS_ICON_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/app.icns")
+    set(PLATFORM_RESOURCES ${MACOS_ICON_FILE})
+    set_source_files_properties(${MACOS_ICON_FILE} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+elseif(TARGET_IOS)
+    set(PLATFORM_RESOURCES "")
+    set(PLATFORM_SOURCES
+        src/platform/ios/IOSSafeAreaProvider.h
+        src/platform/ios/IOSSafeAreaProvider.mm
+    )
+endif()
+
+# Collect all sources
+set(ALL_SOURCES
+    ${CORE_SOURCES}
+    ${NETWORK_SOURCES}
+    ${PANEL_SOURCES}
+    ${STORAGE_SOURCES}
+    ${MODEL_SOURCES}
+    ${VIEWMODEL_SOURCES}
+    ${UTIL_SOURCES}
+    ${UI_SOURCES}
+)
+
+set(AVAILABLE_SOURCES)
+foreach(source ${ALL_SOURCES})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${source})
+        list(APPEND AVAILABLE_SOURCES ${source})
+    endif()
+endforeach()
+
+set(PROJECT_SOURCES
+    src/main.cpp
+    ${AVAILABLE_SOURCES}
+    ${PLATFORM_SOURCES}
+)
+
+# GeoIP data files
+set(GEOIP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources/geoip")
+set(GEOIP_DAT_FILE "${GEOIP_SOURCE_DIR}/geoip.dat")
+set(GEOSITE_DAT_FILE "${GEOIP_SOURCE_DIR}/geosite.dat")
+
+if(EXISTS ${GEOIP_DAT_FILE})
+    message(STATUS "Found geoip.dat")
+endif()
+if(EXISTS ${GEOSITE_DAT_FILE})
+    message(STATUS "Found geosite.dat")
+endif()
+
+# Translation files
+set(TS_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_zh_CN.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_zh_TW.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_en_US.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_fa_IR.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_ru_RU.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_vi_VN.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_km_KH.ts
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/translations/jingo_my_MM.ts
+)
+
+# QML and resource files
+file(GLOB_RECURSE QML_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/qml/*.qml
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/qml/themes/*.qml
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/qml/pages/*.qml
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/qml/components/*.qml
+)
+
+set(AVAILABLE_QML_FILES)
+foreach(qml_file ${QML_FILES})
+    if(EXISTS ${qml_file})
+        file(RELATIVE_PATH file_alias ${CMAKE_CURRENT_SOURCE_DIR}/resources ${qml_file})
+        string(REPLACE "qml/components/" "qml/JinGo/" file_alias "${file_alias}")
+        list(APPEND AVAILABLE_QML_FILES ${qml_file})
+        set_source_files_properties(${qml_file} PROPERTIES QT_RESOURCE_ALIAS ${file_alias})
+    endif()
+endforeach()
+
+set(RESOURCE_FILES resources/resources.qrc)
+
+# Create executable
+if(TARGET_ANDROID)
+    qt_add_executable(JinGo MANUAL_FINALIZATION ${PROJECT_SOURCES})
+elseif(TARGET_MACOS OR TARGET_IOS)
+    qt_add_executable(JinGo MACOSX_BUNDLE ${PROJECT_SOURCES} ${PLATFORM_RESOURCES})
+
+    if(TARGET_IOS)
+        set(INFO_PLIST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/Info.plist)
+        set(IOS_ASSET_CATALOG "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/Assets.xcassets")
+    else()
+        set(INFO_PLIST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist)
+    endif()
+
+    set_target_properties(JinGo PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST ${INFO_PLIST_PATH}
+        MACOSX_BUNDLE_BUNDLE_NAME "JinGoVPN"
+        MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
+        MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${APP_BUNDLE_ID}"
+        QT_NO_DISABLE_WARN_DUPLICATE_LIBRARIES ON
+    )
+
+    if(TARGET_IOS)
+        set_target_properties(JinGo PROPERTIES
+            RESOURCE "${IOS_ASSET_CATALOG}"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${APP_BUNDLE_ID}"
+            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
+        )
+
+        if(APPLE_DEVELOPMENT_TEAM)
+            if(BUILD_KEYCHAIN_PATH)
+                set_target_properties(JinGo PROPERTIES
+                    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+                    XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+                    XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO
+                    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${APPLE_DEVELOPMENT_TEAM}"
+                )
+            else()
+                set_target_properties(JinGo PROPERTIES
+                    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "${APPLE_CODE_SIGN_IDENTITY}"
+                    XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/platform/ios/JinGo.entitlements"
+                    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${APPLE_DEVELOPMENT_TEAM}"
+                    XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+                    XCODE_ATTRIBUTE_PROVISIONING_PROFILE_SPECIFIER "${IOS_PROFILE_MAIN}"
+                )
+            endif()
+        else()
+            set_target_properties(JinGo PROPERTIES
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "iPhone Developer"
+                XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+            )
+        endif()
+
+        # Compile Assets.xcassets
+        find_program(ACTOOL actool HINTS /usr/bin)
+        if(ACTOOL)
+            add_custom_command(TARGET JinGo POST_BUILD
+                COMMAND ${ACTOOL}
+                    --output-format human-readable-text --notices --warnings
+                    --export-dependency-info "$<TARGET_BUNDLE_DIR:JinGo>/assetcatalog_dependencies"
+                    --output-partial-info-plist "$<TARGET_BUNDLE_DIR:JinGo>/assetcatalog_generated_info.plist"
+                    --app-icon AppIcon --compress-pngs --enable-on-demand-resources NO
+                    --platform iphoneos --minimum-deployment-target ${CMAKE_OSX_DEPLOYMENT_TARGET}
+                    --target-device iphone --compile "$<TARGET_BUNDLE_DIR:JinGo>"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/platform/ios/Assets.xcassets"
+                COMMENT "Compiling iOS Assets.xcassets"
+                VERBATIM
+            )
+        endif()
+    else()
+        # macOS
+        set_target_properties(JinGo PROPERTIES
+            RESOURCE "${PLATFORM_RESOURCES}"
+            MACOSX_BUNDLE_ICON_FILE "app.icns"
+            XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${APP_BUNDLE_ID}"
+        )
+
+        if(SKIP_CODE_SIGNING)
+            set_target_properties(JinGo PROPERTIES
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+                XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+                XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO
+            )
+        elseif(APPLE_DEVELOPMENT_TEAM)
+            if(BUILD_KEYCHAIN_PATH)
+                set_target_properties(JinGo PROPERTIES
+                    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+                    XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+                    XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO
+                    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${APPLE_DEVELOPMENT_TEAM}"
+                    XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME YES
+                )
+            else()
+                set_target_properties(JinGo PROPERTIES
+                    XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "${APPLE_CODE_SIGN_IDENTITY}"
+                    XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${APPLE_DEVELOPMENT_TEAM}"
+                    XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+                    XCODE_ATTRIBUTE_PROVISIONING_PROFILE_SPECIFIER "${MACOS_PROFILE_MAIN}"
+                    XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/platform/macos/JinGo.entitlements"
+                    XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME YES
+                    XCODE_ATTRIBUTE_CODE_SIGN_INJECT_BASE_ENTITLEMENTS NO
+                )
+            endif()
+        endif()
+    endif()
+elseif(TARGET_WINDOWS)
+    if(PLATFORM_RC)
+        set(RC_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/JinGo.rc.obj")
+        add_custom_command(
+            OUTPUT ${RC_OUTPUT}
+            COMMAND windres -O coff -I "${CMAKE_CURRENT_SOURCE_DIR}/platform/windows"
+                    "${PLATFORM_RC}" "${RC_OUTPUT}"
+            DEPENDS ${PLATFORM_RC} "${CMAKE_CURRENT_SOURCE_DIR}/platform/windows/JinGo.manifest"
+            COMMENT "Compiling RC file"
+            VERBATIM
+        )
+        qt_add_executable(JinGo WIN32 ${PROJECT_SOURCES} ${RC_OUTPUT})
+    else()
+        qt_add_executable(JinGo WIN32 ${PROJECT_SOURCES})
+    endif()
+else()
+    qt_add_executable(JinGo ${PROJECT_SOURCES})
+endif()
+
+# macOS Helper executables
+if(TARGET_MACOS)
+    # JinGoHelper - setuid helper for routing/DNS
+    set(JINGO_HELPER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/macos/JinGoHelper.cpp")
+    add_executable(JinGoHelper ${JINGO_HELPER_SOURCE})
+    set_target_properties(JinGoHelper PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+        XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+        XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO
+    )
+    add_custom_command(TARGET JinGo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:JinGoHelper>"
+            "$<TARGET_BUNDLE_DIR:JinGo>/Contents/MacOS/JinGoHelper"
+        COMMENT "Copying JinGoHelper to app bundle"
+    )
+    add_dependencies(JinGo JinGoHelper)
+
+    # JinGoCore - core service with Xray
+    set(JINGO_CORE_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/macos/JinGoCore.mm")
+    add_executable(JinGoCore ${JINGO_CORE_SOURCE})
+    set_target_properties(JinGoCore PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+        XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED NO
+        XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED NO
+    )
+
+    target_link_libraries(JinGoCore PRIVATE
+        "${JINDO_LIB_FILE}"
+        Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Qml Qt6::Quick Qt6::Network Qt6::Sql Qt6::Concurrent
+        "-framework Foundation" "-framework CoreFoundation" "-framework Security"
+        "-framework SystemConfiguration" "-framework Network"
+        "-framework NetworkExtension" "-framework SystemExtensions" "-framework UserNotifications"
+        "-framework ServiceManagement" "-framework IOKit"
+        "-lresolv" "-lz"
+    )
+    target_include_directories(JinGoCore PRIVATE
+        "${JINDO_INCLUDE_DIR}"
+    )
+
+    add_custom_command(TARGET JinGo POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:JinGoCore>"
+            "$<TARGET_BUNDLE_DIR:JinGo>/Contents/MacOS/JinGoCore"
+        COMMENT "Copying JinGoCore to app bundle"
+    )
+    add_dependencies(JinGo JinGoCore)
+endif()
+
+# Exclude FFmpeg multimedia plugins on Apple
+if(TARGET_IOS OR TARGET_MACOS)
+    qt_import_plugins(JinGo EXCLUDE_BY_TYPE multimedia)
+endif()
+
+# QML module
+if(POLICY CMP0071)
+    cmake_policy(SET CMP0071 NEW)
+endif()
+if(COMMAND qt_policy)
+    qt_policy(SET QTP0001 NEW)
+    qt_policy(SET QTP0004 NEW)
+endif()
+
+if(AVAILABLE_QML_FILES OR RESOURCE_FILES)
+    set(QMLDIR_FILE ${CMAKE_CURRENT_SOURCE_DIR}/resources/qml/components/qmldir)
+    if(EXISTS ${QMLDIR_FILE})
+        set_source_files_properties(${QMLDIR_FILE} PROPERTIES QT_RESOURCE_ALIAS qml/JinGo/qmldir)
+        list(APPEND RESOURCE_FILES ${QMLDIR_FILE})
+    endif()
+
+    qt_add_qml_module(JinGo
+        URI JinGo
+        VERSION 1.0
+        QML_FILES ${AVAILABLE_QML_FILES}
+        RESOURCES ${RESOURCE_FILES}
+        NO_RESOURCE_TARGET_PATH
+        NO_CACHEGEN
+        NO_GENERATE_QMLDIR
+        OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/qml
+        RESOURCE_PREFIX "/"
+    )
+endif()
+
+# Translations
+qt_add_translations(JinGo
+    TS_FILES ${TS_FILES}
+    SOURCES ${PROJECT_SOURCES} ${AVAILABLE_QML_FILES}
+    RESOURCE_PREFIX "/translations"
+)
+
+if(TARGET_ANDROID)
+    set_property(TARGET JinGo APPEND PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/platform/android")
+    if(DEFINED QT_ANDROID_ABIS)
+        set_property(TARGET JinGo PROPERTY QT_ANDROID_ABIS "${QT_ANDROID_ABIS}")
+    endif()
+endif()
+
+# GeoIP data installation
+set(GEOIP_FILES)
+if(EXISTS ${GEOIP_DAT_FILE})
+    list(APPEND GEOIP_FILES ${GEOIP_DAT_FILE})
+endif()
+if(EXISTS ${GEOSITE_DAT_FILE})
+    list(APPEND GEOIP_FILES ${GEOSITE_DAT_FILE})
+endif()
+
+if(GEOIP_FILES)
+    if(TARGET_MACOS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:JinGo>/Contents/Resources/dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOIP_DAT_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/Contents/Resources/dat/geoip.dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOSITE_DAT_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/Contents/Resources/dat/geosite.dat"
+            COMMENT "Copying GeoIP data files"
+        )
+    elseif(TARGET_IOS)
+        set(GEOIP_IOS_DAT_FILE "${GEOIP_SOURCE_DIR}/geoip_ios.dat")
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOIP_IOS_DAT_FILE} "$<TARGET_BUNDLE_DIR:JinGo>/geoip.dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOSITE_DAT_FILE} "$<TARGET_BUNDLE_DIR:JinGo>/geosite.dat"
+            COMMENT "Copying GeoIP data files (iOS uses filtered geoip)"
+        )
+    elseif(TARGET_ANDROID)
+        set(ANDROID_GEOIP_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/assets/dat")
+        file(MAKE_DIRECTORY "${ANDROID_GEOIP_ASSETS_DIR}")
+    elseif(TARGET_WINDOWS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:JinGo>/dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOIP_DAT_FILE} "$<TARGET_FILE_DIR:JinGo>/dat/geoip.dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOSITE_DAT_FILE} "$<TARGET_FILE_DIR:JinGo>/dat/geosite.dat"
+            COMMENT "Copying GeoIP data files"
+        )
+    else()
+        # Linux 平台：复制到 dat 子目录
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin/dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOIP_DAT_FILE} "${CMAKE_BINARY_DIR}/bin/dat/geoip.dat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GEOSITE_DAT_FILE} "${CMAKE_BINARY_DIR}/bin/dat/geosite.dat"
+            COMMENT "Copying GeoIP data files to dat/"
+        )
+    endif()
+endif()
+
+# Bundle config deployment
+set(BUNDLE_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources/bundle_config.json")
+set(LICENSE_PUBLIC_KEY_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources/license_public_key.pem")
+
+if(EXISTS ${BUNDLE_CONFIG_FILE})
+    if(TARGET_MACOS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BUNDLE_CONFIG_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/Contents/Resources/bundle_config.json"
+            COMMENT "Copying bundle_config.json"
+        )
+    elseif(TARGET_IOS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BUNDLE_CONFIG_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/bundle_config.json"
+            COMMENT "Copying bundle_config.json"
+        )
+    elseif(TARGET_ANDROID)
+        set(ANDROID_CONFIG_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/assets")
+        file(MAKE_DIRECTORY "${ANDROID_CONFIG_ASSETS_DIR}")
+        file(COPY ${BUNDLE_CONFIG_FILE} DESTINATION "${ANDROID_CONFIG_ASSETS_DIR}")
+    elseif(TARGET_WINDOWS OR TARGET_LINUX)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BUNDLE_CONFIG_FILE}
+                "$<TARGET_FILE_DIR:JinGo>/bundle_config.json"
+            COMMENT "Copying bundle_config.json"
+        )
+    endif()
+endif()
+
+# License public key deployment
+if(EXISTS ${LICENSE_PUBLIC_KEY_FILE})
+    if(TARGET_MACOS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LICENSE_PUBLIC_KEY_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/Contents/Resources/license_public_key.pem"
+            COMMENT "Copying license_public_key.pem"
+        )
+    elseif(TARGET_IOS)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LICENSE_PUBLIC_KEY_FILE}
+                "$<TARGET_BUNDLE_DIR:JinGo>/license_public_key.pem"
+            COMMENT "Copying license_public_key.pem"
+        )
+    elseif(TARGET_ANDROID)
+        if(NOT ANDROID_CONFIG_ASSETS_DIR)
+            set(ANDROID_CONFIG_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/platform/android/assets")
+        endif()
+        file(MAKE_DIRECTORY "${ANDROID_CONFIG_ASSETS_DIR}")
+        file(COPY ${LICENSE_PUBLIC_KEY_FILE} DESTINATION "${ANDROID_CONFIG_ASSETS_DIR}")
+    elseif(TARGET_WINDOWS OR TARGET_LINUX)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${LICENSE_PUBLIC_KEY_FILE}
+                "$<TARGET_FILE_DIR:JinGo>/license_public_key.pem"
+            COMMENT "Copying license_public_key.pem"
+        )
+    endif()
+endif()
+
+# Include directories
+target_include_directories(JinGo PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/viewmodels
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ui
+    ${CMAKE_CURRENT_BINARY_DIR}/JinGo_autogen/include
+)
+
+if(WIN32)
+    target_include_directories(JinGo PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wintun/include
+        ${JINDO_INCLUDE_DIR}
+    )
+elseif(TARGET_LINUX)
+    target_include_directories(JinGo PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/linux
+        ${JINDO_INCLUDE_DIR}
+    )
+endif()
+
+# SuperRay headers included via JinDoCore, no separate include needed
+
+if(TARGET_ANDROID)
+    target_include_directories(JinGo PRIVATE ${Qt6Core_PRIVATE_INCLUDE_DIRS})
+endif()
+
+# Link libraries
+target_link_libraries(JinGo PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Qml
+    Qt6::Quick
+    Qt6::QuickControls2
+    Qt6::Network
+    Qt6::Sql
+    Qt6::Concurrent
+    ${PLATFORM_LIBS}
+)
+
+# Link JinDoCore
+if(TARGET JinDoCore)
+    # Force linking all symbols from static library to preserve Go init() registrations
+    if(WIN32 AND MINGW)
+        target_link_libraries(JinGo PRIVATE -Wl,--whole-archive JinDoCore -Wl,--no-whole-archive)
+    elseif(APPLE)
+        target_link_libraries(JinGo PRIVATE -Wl,-force_load,$<TARGET_FILE:JinDoCore>)
+    else()
+        target_link_libraries(JinGo PRIVATE JinDoCore)
+    endif()
+    target_include_directories(JinGo PRIVATE
+        ${JINDO_INCLUDE_DIR}
+        ${JINDO_INCLUDE_DIR}/core
+        ${JINDO_INCLUDE_DIR}/platform
+        ${JINDO_INCLUDE_DIR}/platform/apple
+        ${JINDO_INCLUDE_DIR}/storage
+        ${JINDO_INCLUDE_DIR}/utils
+        ${JINDO_INCLUDE_DIR}/extensions
+        ${JINDO_INCLUDE_DIR}/extensions/PacketTunnelProvider
+    )
+
+    # Apple platforms: SuperRay (Go) needs resolv library for DNS
+    if(TARGET_MACOS OR TARGET_IOS)
+        target_link_libraries(JinGo PRIVATE "-lresolv" "-lz")
+    endif()
+
+    if(TARGET_WINDOWS)
+        set(WINPTHREAD_STATIC_LIB "D:/Qt/Tools/mingw1310_64/x86_64-w64-mingw32/lib/libwinpthread.a")
+        if(EXISTS "${WINPTHREAD_STATIC_LIB}")
+            target_link_libraries(JinGo PRIVATE
+                Qt6::Sql Qt6::Gui Qt6::Widgets
+                wininet crypt32 ${WINPTHREAD_STATIC_LIB}
+            )
+        endif()
+    endif()
+
+    if(TARGET_LINUX)
+        # Link wrapper object to provide __res_search symbol for Go/CGO
+        add_dependencies(JinGo res_search_wrapper)
+        target_link_libraries(JinGo PRIVATE
+            Qt6::Sql Qt6::Gui Qt6::Widgets ${PLATFORM_LIBS}
+            "${CMAKE_CURRENT_BINARY_DIR}/res_search_wrapper.o"
+            "-lresolv" "-lz"
+        )
+    endif()
+endif()
+
+if(UNIX AND NOT APPLE AND NOT ANDROID AND TARGET Qt6::DBus)
+    target_link_libraries(JinGo PRIVATE Qt6::DBus)
+endif()
+
+# OpenSSL / Platform crypto
+if(TARGET_ANDROID OR ANDROID)
+    set(ANDROID_OPENSSL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/android_openssl")
+    if(EXISTS "${ANDROID_OPENSSL_ROOT}/${ANDROID_ABI}")
+        target_include_directories(JinGo PRIVATE "${ANDROID_OPENSSL_ROOT}/include")
+        target_link_libraries(JinGo PRIVATE
+            "${ANDROID_OPENSSL_ROOT}/${ANDROID_ABI}/libssl_3.so"
+            "${ANDROID_OPENSSL_ROOT}/${ANDROID_ABI}/libcrypto_3.so"
+        )
+    endif()
+elseif(TARGET_IOS OR TARGET_MACOS)
+    message(STATUS "Using Security.framework + CommonCrypto")
+elseif(WIN32)
+    message(STATUS "Using BCrypt/NCrypt (CNG)")
+else()
+    set(LINUX_OPENSSL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/linux_openssl")
+    if(EXISTS "${LINUX_OPENSSL_ROOT}/x86_64/libssl.so")
+        target_include_directories(JinGo PRIVATE "${LINUX_OPENSSL_ROOT}/include")
+        target_link_libraries(JinGo PRIVATE
+            "${LINUX_OPENSSL_ROOT}/x86_64/libssl.so"
+            "${LINUX_OPENSSL_ROOT}/x86_64/libcrypto.so"
+        )
+    else()
+        find_package(OpenSSL REQUIRED)
+        target_link_libraries(JinGo PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
+endif()
+
+# Compile definitions
+target_compile_definitions(JinGo PRIVATE
+    QT_DEPRECATED_WARNINGS
+    QT_DISABLE_DEPRECATED_BEFORE=0x060500
+    APP_VERSION="${PROJECT_VERSION}"
+    APP_NAME="JinGoVPN"
+    APP_ORGANIZATION="JinGo"
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_definitions(JinGo PRIVATE QT_QML_DEBUG DEBUG_MODE QT_MESSAGELOGCONTEXT ENABLE_VERBOSE_LOGGING)
+elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_compile_definitions(JinGo PRIVATE QT_NO_DEBUG_OUTPUT NDEBUG QT_NO_WARNING_OUTPUT)
+endif()
+
+# 安全功能开关 (CI 构建时启用，本地开发默认关闭)
+option(ENABLE_LICENSE_CHECK "Enable license verification at startup" OFF)
+option(ENABLE_CONFIG_SIGNATURE_VERIFY "Enable bundle_config.json signature verification" OFF)
+
+if(ENABLE_LICENSE_CHECK)
+    target_compile_definitions(JinGo PRIVATE ENABLE_LICENSE_CHECK)
+    message(STATUS "License check: ENABLED")
+else()
+    message(STATUS "License check: DISABLED (development mode)")
+endif()
+
+if(ENABLE_CONFIG_SIGNATURE_VERIFY)
+    target_compile_definitions(JinGo PRIVATE ENABLE_CONFIG_SIGNATURE_VERIFY)
+    message(STATUS "Config signature verification: ENABLED")
+else()
+    message(STATUS "Config signature verification: DISABLED (development mode)")
+endif()
+
+# SuperRay integration
+# SuperRay is statically merged into JinDoCore on all platforms (including Windows)
+target_compile_definitions(JinGo PRIVATE HAVE_SUPERRAY)
+
+# RPATH configuration
+if(TARGET_LINUX)
+    set_target_properties(JinGo PROPERTIES
+        INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+        BUILD_WITH_INSTALL_RPATH OFF
+    )
+elseif(TARGET_MACOS)
+    set_target_properties(JinGo PROPERTIES
+        INSTALL_RPATH "@executable_path/../Frameworks"
+        BUILD_WITH_INSTALL_RPATH OFF
+    )
+endif()
+
+# Windows: WinTun and deployment
+if(WIN32)
+    set(WINTUN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wintun")
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(WINTUN_DLL "${WINTUN_ROOT}/bin/amd64/wintun.dll")
+    else()
+        set(WINTUN_DLL "${WINTUN_ROOT}/bin/x86/wintun.dll")
+    endif()
+
+    if(EXISTS ${WINTUN_DLL})
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WINTUN_DLL}" "$<TARGET_FILE_DIR:JinGo>/wintun.dll"
+            COMMENT "Copying wintun.dll"
+        )
+    endif()
+
+    find_program(WINDEPLOYQT_EXECUTABLE windeployqt HINTS ${CMAKE_PREFIX_PATH}/bin)
+    if(WINDEPLOYQT_EXECUTABLE)
+        add_custom_command(TARGET JinGo POST_BUILD
+            COMMAND ${WINDEPLOYQT_EXECUTABLE}
+                --qmldir "${CMAKE_SOURCE_DIR}/resources/qml"
+                --no-compiler-runtime --no-translations
+                "$<TARGET_FILE:JinGo>"
+            COMMENT "Running windeployqt"
+        )
+        # sqldrivers plugin is copied by build-windows.sh
+    endif()
+
+    # Copy MinGW runtime DLLs
+    get_filename_component(MINGW_BIN_DIR ${CMAKE_CXX_COMPILER} DIRECTORY)
+    foreach(dll "libgcc_s_seh-1.dll" "libstdc++-6.dll" "libwinpthread-1.dll")
+        if(EXISTS "${MINGW_BIN_DIR}/${dll}")
+            add_custom_command(TARGET JinGo POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MINGW_BIN_DIR}/${dll}" "$<TARGET_FILE_DIR:JinGo>/${dll}"
+            )
+        endif()
+    endforeach()
+endif()
+
+# Linux: TUN permissions
+# 注意：不自动设置cap_net_admin，避免构建时要求sudo密码
+# 用户应手动执行：sudo setcap cap_net_admin+eip ./build-linux/bin/JinGo
+if(TARGET_LINUX)
+    # 检查权限但不自动设置
+    add_custom_command(TARGET JinGo POST_BUILD
+        COMMAND bash -c "echo ''; echo '==> Linux TUN 权限设置提示:'; \
+            echo '    如需使用 TUN 模式，请运行:'; \
+            echo '    sudo setcap cap_net_admin+eip $<TARGET_FILE:JinGo>'; echo ''"
+        COMMENT "Linux TUN permission info"
+        VERBATIM
+    )
+endif()
+
+# Compile options
+if(MSVC)
+    target_compile_options(JinGo PRIVATE /W4 /utf-8 /MP /Zc:__cplusplus /permissive-)
+else()
+    target_compile_options(JinGo PRIVATE
+        -Wall -Wextra -Wpedantic
+        $<$<CONFIG:Release>:-O3>
+        -Wno-unknown-pragmas -Wno-unused-parameter -Wno-unused-variable
+        -Wno-missing-field-initializers -Wno-sign-compare
+    )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(JinGo PRIVATE
+            -Wno-cast-function-type
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-reorder>
+            -Wno-stringop-overread
+        )
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_options(JinGo PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-reorder-ctor>)
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(JinGo PRIVATE -Wno-unused-result)
+    endif()
+endif()
+
+if(TARGET_MACOS OR TARGET_IOS)
+    target_compile_options(JinGo PRIVATE -fmodules -fcxx-modules)
+    set_target_properties(JinGo PROPERTIES
+        XCODE_ATTRIBUTE_CLANG_ENABLE_MODULES YES
+        XCODE_ATTRIBUTE_CLANG_ENABLE_OBJC_ARC YES
+    )
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MSVC)
+    target_compile_options(JinGo PRIVATE -O2)
+endif()
+
+# Platform finalization
+if(TARGET_ANDROID)
+    include(cmake/Platform-Android-Finalize.cmake)
+endif()
+
+# iOS Network Extension
+if(TARGET_IOS)
+    include(cmake/Extension-PacketTunnel.cmake)
+endif()
+
+# Apple code signing
+if(APPLE AND NOT ANDROID)
+    include(cmake/Signing-Apple.cmake)
+endif()
+
+# Linux RPATH 设置
+if(LINUX AND NOT TARGET_ANDROID)
+    # 设置 RPATH 以便安装后能找到 Qt 库
+    set_target_properties(JinGo PROPERTIES
+        BUILD_RPATH "$ORIGIN:$ORIGIN/lib:$ORIGIN/../lib"
+        INSTALL_RPATH "$ORIGIN/../lib/jingo:$ORIGIN/../lib"
+        BUILD_WITH_INSTALL_RPATH OFF
+        INSTALL_RPATH_USE_LINK_PATH OFF
+    )
+endif()
+
+# Linux installation
+if(LINUX AND NOT TARGET_ANDROID)
+    include(GNUInstallDirs)
+
+    # 二进制文件
+    install(TARGETS JinGo
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT applications)
+
+    # 启动器脚本
+    install(PROGRAMS platform/linux/jingo-launcher.sh
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RENAME jingo-launcher
+        COMPONENT applications)
+
+    # 命令行符号链接 (jingo -> jingo-launcher)
+    install(CODE "
+        execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
+            jingo-launcher
+            \$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/jingo)
+    " COMPONENT applications)
+
+    # Desktop 文件
+    install(FILES platform/linux/jingo.desktop
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications
+        COMPONENT applications)
+
+    # PolicyKit 策略
+    install(FILES platform/linux/work.opine.jingo.policy
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/polkit-1/actions
+        COMPONENT applications)
+
+    # 图标 (多尺寸)
+    install(FILES resources/icons/app.png
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/512x512/apps
+        RENAME jingo.png
+        COMPONENT applications)
+    install(FILES resources/icons/app.png
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/pixmaps
+        RENAME jingo.png
+        COMPONENT applications)
+
+    # 文档
+    install(FILES README.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR}
+        COMPONENT applications)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/QUICK_REFERENCE.md)
+        install(FILES QUICK_REFERENCE.md
+            DESTINATION ${CMAKE_INSTALL_DOCDIR}
+            COMPONENT applications)
+    endif()
+
+    # License
+    if(EXISTS ${CMAKE_SOURCE_DIR}/LICENSE)
+        install(FILES LICENSE
+            DESTINATION ${CMAKE_INSTALL_DOCDIR}
+            COMPONENT applications)
+    endif()
+
+    # Changelog
+    if(EXISTS ${CMAKE_SOURCE_DIR}/platform/linux/changelog)
+        install(FILES platform/linux/changelog
+            DESTINATION ${CMAKE_INSTALL_DOCDIR}
+            COMPONENT applications)
+    endif()
+
+    # Copyright (Debian 规范)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/platform/linux/copyright)
+        install(FILES platform/linux/copyright
+            DESTINATION ${CMAKE_INSTALL_DOCDIR}
+            COMPONENT applications)
+    endif()
+
+    # DAT 文件 (geoip.dat, geosite.dat 路由规则)
+    if(EXISTS ${CMAKE_SOURCE_DIR}/resources/geoip/geoip.dat)
+        install(FILES
+            ${CMAKE_SOURCE_DIR}/resources/geoip/geoip.dat
+            ${CMAKE_SOURCE_DIR}/resources/geoip/geosite.dat
+            DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/jingo/dat
+            COMPONENT applications)
+    endif()
+
+    # bundle_config.json (应用配置文件)
+    if(EXISTS ${CMAKE_BINARY_DIR}/bin/bundle_config.json)
+        install(FILES ${CMAKE_BINARY_DIR}/bin/bundle_config.json
+            DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/jingo
+            COMPONENT applications)
+    endif()
+
+    # Qt 库和插件（动态安装，在打包时检查是否存在）
+    install(CODE "
+        set(LIB_SRC \"${CMAKE_BINARY_DIR}/bin/lib\")
+        set(PLUGIN_SRC \"${CMAKE_BINARY_DIR}/bin/plugins\")
+
+        if(EXISTS \"\${LIB_SRC}\")
+            message(STATUS \"安装 Qt 库: \${LIB_SRC} -> \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo\")
+            file(GLOB_RECURSE LIB_FILES \"\${LIB_SRC}/*.so*\")
+            foreach(lib_file \${LIB_FILES})
+                file(RELATIVE_PATH rel_path \"\${LIB_SRC}\" \"\${lib_file}\")
+                get_filename_component(rel_dir \"\${rel_path}\" DIRECTORY)
+                file(INSTALL \"\${lib_file}\"
+                     DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo/\${rel_dir}\"
+                     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+            endforeach()
+        endif()
+
+        if(EXISTS \"\${PLUGIN_SRC}\")
+            message(STATUS \"安装 Qt 插件: \${PLUGIN_SRC} -> \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo/plugins\")
+            file(GLOB_RECURSE PLUGIN_FILES \"\${PLUGIN_SRC}/*.so\")
+            foreach(plugin_file \${PLUGIN_FILES})
+                file(RELATIVE_PATH rel_path \"\${PLUGIN_SRC}\" \"\${plugin_file}\")
+                get_filename_component(rel_dir \"\${rel_path}\" DIRECTORY)
+                file(INSTALL \"\${plugin_file}\"
+                     DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo/plugins/\${rel_dir}\"
+                     FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+            endforeach()
+        endif()
+
+        set(QML_SRC \"${CMAKE_BINARY_DIR}/bin/qml\")
+        if(EXISTS \"\${QML_SRC}\")
+            message(STATUS \"安装 QML 模块: \${QML_SRC} -> \${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo/qml\")
+            file(GLOB_RECURSE QML_FILES \"\${QML_SRC}/*\")
+            foreach(qml_file \${QML_FILES})
+                file(RELATIVE_PATH rel_path \"\${QML_SRC}\" \"\${qml_file}\")
+                get_filename_component(rel_dir \"\${rel_path}\" DIRECTORY)
+                file(INSTALL \"\${qml_file}\"
+                     DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/jingo/qml/\${rel_dir}\")
+            endforeach()
+        endif()
+    " COMPONENT applications)
+
+    # 创建并安装 qt.conf
+    file(WRITE ${CMAKE_BINARY_DIR}/qt.conf "[Paths]\nPlugins = ../lib/jingo/plugins\nLibraries = ../lib/jingo\nQml2Imports = ../lib/jingo/qml\n")
+    install(FILES ${CMAKE_BINARY_DIR}/qt.conf
+        DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT applications)
+
+    # 配置目录由 postinst 脚本创建（DEB/RPM）
+    # Tarball 用户需要手动创建或由程序自动创建
+endif()
+
+# Finalize Qt target for mobile
+if(TARGET_IOS OR TARGET_ANDROID)
+    qt_finalize_target(JinGo)
+endif()
+
+# CPack packaging (Linux)
+if(LINUX AND NOT TARGET_ANDROID)
+    set(CPACK_PACKAGE_NAME "jingo")
+    set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "JinGo VPN Client - Secure and Fast VPN Solution")
+    set(CPACK_PACKAGE_DESCRIPTION "JinGo is a cross-platform VPN client built on Xray-core technology.
+ It provides secure, fast, and reliable VPN connections with support for multiple
+ protocols including VMess, VLESS, Trojan, Shadowsocks, and WireGuard.
+ .
+ Features:
+  - Multiple protocol support (VMess, VLESS, Trojan, SS, WireGuard)
+  - Automatic network interface binding
+  - Built-in routing rules
+  - Modern Qt6-based GUI
+  - Support for subscription URLs")
+    set(CPACK_PACKAGE_VENDOR "JinGo")
+    set(CPACK_PACKAGE_CONTACT "JinGo Team <support@jingo.app>")
+    set(CPACK_PACKAGE_HOMEPAGE_URL "https://jingo.app")
+
+    # DEB (Debian/Ubuntu)
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libqt6core6 (>= 6.2), libqt6gui6 (>= 6.2), libqt6network6 (>= 6.2), libqt6qml6 (>= 6.2), libqt6quick6 (>= 6.2), libqt6widgets6 (>= 6.2), libqt6sql6 (>= 6.2), libxcb-cursor0, policykit-1")
+    set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "")
+    set(CPACK_DEBIAN_PACKAGE_SUGGESTS "")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "net")
+    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "JinGo Team <support@jingo.app>")
+    set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")  # 生成 jingo_1.0.0_amd64.deb 格式
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)    # 禁用自动检测（已手动指定依赖）
+
+    # DEB 包控制脚本
+    set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+        "${CMAKE_SOURCE_DIR}/platform/linux/debian/postinst"
+        "${CMAKE_SOURCE_DIR}/platform/linux/debian/postrm")
+
+    # RPM (Fedora/RHEL)
+    set(CPACK_RPM_PACKAGE_LICENSE "Proprietary")
+    set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
+    set(CPACK_RPM_PACKAGE_REQUIRES "qt6-qtbase >= 6.2, qt6-qtdeclarative >= 6.2, polkit")
+    set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")  # 生成 jingo-1.0.0.x86_64.rpm 格式
+    set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)   # 自动检测依赖
+
+    # TGZ (通用 tarball)
+    set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+
+    # 默认生成所有类型（可通过 -G 选项覆盖）
+    set(CPACK_GENERATOR "DEB;TGZ")
+
+    # 资源文件（README, LICENSE 等）
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_SOURCE_DIR}/README.md")
+    if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
+        set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
+    endif()
+
+    include(CPack)
+endif()
+
+# Configuration summary
+message(STATUS "")
+message(STATUS "========================================")
+message(STATUS "JinGoVPN Configuration Summary")
+message(STATUS "========================================")
+message(STATUS "  Version:        ${PROJECT_VERSION}")
+message(STATUS "  Platform:       ${PLATFORM_NAME}")
+message(STATUS "  Build Type:     ${CMAKE_BUILD_TYPE}")
+message(STATUS "  C++ Standard:   C++${CMAKE_CXX_STANDARD}")
+message(STATUS "  Qt Version:     ${Qt6_VERSION}")
+message(STATUS "  JinDoCore:      ${JINDO_LIB_FILE}")
+if(TARGET_ANDROID)
+    message(STATUS "  Android API:    ${ANDROID_MIN_SDK_VERSION} - ${ANDROID_TARGET_SDK_VERSION}")
+endif()
+message(STATUS "========================================")
+message(STATUS "")

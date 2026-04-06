@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=JinGoVPN
+Comment=Cross-platform VPN Client
+GenericName=VPN Client
+Exec=/usr/bin/jingo-launcher
+Icon=jingo
+Categories=Network;
+Terminal=false
+StartupNotify=true
+StartupWMClass=JinGo
+Keywords=VPN;Network;Security;Proxy;
